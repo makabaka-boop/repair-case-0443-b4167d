@@ -11,6 +11,7 @@ import (
 
 	"batchseal/internal/store"
 
+	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 )
 
@@ -808,6 +809,35 @@ func waitForTupleLock(ctx context.Context, t *testing.T, schema, batchID string)
 	return false
 }
 
+// waitForRelationLockWaiter polls until some backend is waiting (ungranted)
+// for the given lock mode on schema.table, returning false on timeout. It
+// confirms a staged transaction has reached its blocking point, e.g. a gap
+// query parked behind a table-level gate lock.
+func waitForRelationLockWaiter(ctx context.Context, t *testing.T, schema, table, mode string) bool {
+	t.Helper()
+	deadline := time.Now().Add(10 * time.Second)
+	for time.Now().Before(deadline) {
+		var waiting bool
+		err := basePool.QueryRow(ctx, `
+			SELECT EXISTS (
+				SELECT 1
+				FROM pg_locks
+				WHERE locktype = 'relation'
+				  AND relation = ($1 || '.' || $2)::regclass
+				  AND mode = $3
+				  AND granted = false
+			)`, schema, table, mode).Scan(&waiting)
+		if err != nil {
+			t.Fatalf("scan lock state: %v", err)
+		}
+		if waiting {
+			return true
+		}
+		time.Sleep(2 * time.Millisecond)
+	}
+	return false
+}
+
 // TestSealGroupReversedRequestsResponseMatchesDB deterministically reproduces
 // the reversed-order group race: [A,B] and [B,A] validate while holding the
 // same locks in series, then (in the buggy implementation) both applied their
@@ -1132,6 +1162,180 @@ func TestSealGroupSeesChunkCommittedDuringLockWait(t *testing.T) {
 		if db.Status != store.StatusSealed || len(db.Gaps) != 0 ||
 			db.SealedAt == nil || !db.SealedAt.Equal(*snaps[i].SealedAt) {
 			t.Fatalf("database disagrees with group response: db=%+v resp=%+v", db, snaps[i])
+		}
+	}
+}
+
+// TestSealGroupIncompleteReportsVerdictSnapshot stages the mirror image of
+// TestSealGroupSeesChunkCommittedDuringLockWait: the group computes its
+// INCOMPLETE verdict under the member locks (B is still missing seq 2), and
+// B's final chunk commits only AFTER the group transaction ends. The
+// ErrIncomplete response must still describe the state the verdict was based
+// on — B missing seq 2. Re-reading members after the locks are released
+// would observe the just-committed chunk and report B gapless, which the API
+// layer filters into a 409 INCOMPLETE with an empty batches list: a failure
+// response that contradicts both itself and the database, and that hides
+// which member (and which seq) the caller still owes.
+//
+// The interleave is deterministic. A gate transaction holds ACCESS EXCLUSIVE
+// on chunks, so the group parks at its gap query while holding the member
+// locks. A second gate queues ACCESS EXCLUSIVE on batches behind the group:
+// once the group's transaction ends, that gate holds the table, so any
+// member re-read outside the verdict transaction parks behind it while the
+// final chunk lands. The replayed final-chunk insert queues behind the
+// chunks gate and then behind the group's row lock on B (foreign-key check),
+// exactly like a concurrent submission that lost the lock race.
+func TestSealGroupIncompleteReportsVerdictSnapshot(t *testing.T) {
+	ctx := context.Background()
+	s, _ := newStore(ctx, t)
+
+	a := mustBatch(ctx, t, s, 1)
+	b := mustBatch(ctx, t, s, 2)
+	if _, err := s.SubmitChunk(ctx, a.ID, 1, []byte("a")); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.SubmitChunk(ctx, b.ID, 1, []byte("b1")); err != nil {
+		t.Fatal(err)
+	}
+	// B is missing only its final chunk (seq 2).
+
+	schema := testSchema(t)
+	beginRaw := func() pgx.Tx {
+		t.Helper()
+		tx, err := basePool.Begin(ctx)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := tx.Exec(ctx, "SET LOCAL search_path = "+schema); err != nil {
+			t.Fatal(err)
+		}
+		return tx
+	}
+
+	// Gate 1: hold chunks exclusively so the group seal parks at its gap
+	// query while already holding the member row locks.
+	chunksGate := beginRaw()
+	defer chunksGate.Rollback(ctx)
+	if _, err := chunksGate.Exec(ctx, "LOCK TABLE chunks IN ACCESS EXCLUSIVE MODE"); err != nil {
+		t.Fatal(err)
+	}
+
+	groupDone := make(chan struct{})
+	var snaps []*store.Snapshot
+	var groupErr error
+	go func() {
+		defer close(groupDone)
+		snaps, groupErr = s.SealGroup(ctx, []string{a.ID, b.ID})
+	}()
+	if !waitForRelationLockWaiter(ctx, t, schema, "chunks", "AccessShareLock") {
+		t.Fatal("group seal never parked on its gap query")
+	}
+
+	// Replay the final chunk's critical section on a raw connection. The
+	// ACCESS SHARE lock on batches is taken up front so the batches gate
+	// below can never park this insert behind itself; the INSERT itself
+	// queues behind gate 1 and then behind the group's row lock on B.
+	chunkTx := beginRaw()
+	defer chunkTx.Rollback(ctx)
+	if _, err := chunkTx.Exec(ctx, "LOCK TABLE batches IN ACCESS SHARE MODE"); err != nil {
+		t.Fatal(err)
+	}
+	chunkInserted := make(chan error, 1)
+	go func() {
+		_, err := chunkTx.Exec(ctx,
+			`INSERT INTO chunks (batch_id, seq, payload) VALUES ($1, $2, $3)`,
+			b.ID, 2, []byte("b2"))
+		chunkInserted <- err
+	}()
+
+	// Gate 2: queue ACCESS EXCLUSIVE on batches behind the group (and the
+	// replayed chunk). A queued ACCESS EXCLUSIVE request blocks later
+	// ACCESS SHARE requests, so a post-rollback member refresh parks here.
+	batchesGate := beginRaw()
+	defer batchesGate.Rollback(ctx)
+	batchesGateLocked := make(chan error, 1)
+	go func() {
+		_, err := batchesGate.Exec(ctx, "LOCK TABLE batches IN ACCESS EXCLUSIVE MODE")
+		batchesGateLocked <- err
+	}()
+	if !waitForRelationLockWaiter(ctx, t, schema, "batches", "AccessExclusiveLock") {
+		t.Fatal("batches gate never queued behind the group")
+	}
+
+	// Release gate 1: the group computes its verdict (B still missing seq 2 —
+	// the chunk is uncommitted and its insert has not even executed), decides
+	// INCOMPLETE and ends its transaction. The chunk insert then clears the
+	// row lock and completes; commit it so B's final chunk is durable BEFORE
+	// any post-verdict re-read could run.
+	if err := chunksGate.Commit(ctx); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case err := <-chunkInserted:
+		if err != nil {
+			t.Fatalf("final chunk insert: %v", err)
+		}
+	case <-time.After(30 * time.Second):
+		t.Fatal("final chunk insert never cleared the group's row lock")
+	}
+	if err := chunkTx.Commit(ctx); err != nil {
+		t.Fatal(err)
+	}
+
+	// Gate 2 is granted once the replayed chunk commits; release it so a
+	// post-rollback refresh (the bug) unblocks and reads B complete. The
+	// verdict snapshots were returned before any of this.
+	select {
+	case err := <-batchesGateLocked:
+		if err != nil {
+			t.Fatalf("batches gate lock: %v", err)
+		}
+	case <-time.After(30 * time.Second):
+		t.Fatal("batches gate never acquired its lock")
+	}
+	if err := batchesGate.Commit(ctx); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case <-groupDone:
+	case <-time.After(30 * time.Second):
+		t.Fatal("group seal deadlocked")
+	}
+
+	if !errors.Is(groupErr, store.ErrIncomplete) {
+		t.Fatalf("group must refuse with ErrIncomplete, got %v", groupErr)
+	}
+	if len(snaps) != 2 || snaps[0].ID != a.ID || snaps[1].ID != b.ID {
+		t.Fatalf("error snapshots not in request order: %+v", snaps)
+	}
+	// The response must name the member and the gap that caused the refusal.
+	// With the bug, B is reported gapless here (its chunk committed before
+	// the refresh), and the API would list NO incomplete member at all.
+	if snaps[0].Status != store.StatusOpen || len(snaps[0].Gaps) != 0 {
+		t.Fatalf("complete member snapshot wrong: %+v", snaps[0])
+	}
+	if snaps[1].Status != store.StatusOpen || snaps[1].Received != 1 ||
+		len(snaps[1].Gaps) != 1 || snaps[1].Gaps[0] != 2 {
+		t.Fatalf("incomplete member must report the verdict-time gap seq=2: %+v", snaps[1])
+	}
+
+	// The world the caller observes afterwards: B is complete but still
+	// OPEN, and a retry seals the whole group — exactly what the verdict
+	// response already explained.
+	dbB, err := s.Snapshot(ctx, b.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if dbB.Status != store.StatusOpen || len(dbB.Gaps) != 0 {
+		t.Fatalf("B must be complete and OPEN after the race: %+v", dbB)
+	}
+	sealed, err := s.SealGroup(ctx, []string{a.ID, b.ID})
+	if err != nil {
+		t.Fatalf("retry after the final chunk landed: %v", err)
+	}
+	for _, snap := range sealed {
+		if snap.Status != store.StatusSealed {
+			t.Fatalf("retry did not seal the group: %+v", sealed)
 		}
 	}
 }

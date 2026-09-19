@@ -736,3 +736,107 @@ func TestHTTPSealGroupThreeWayRace(t *testing.T) {
 		}
 	}
 }
+
+// TestHTTPSealGroupIncompleteNeverEmptyBatches races the group seal against
+// B's final chunk on the other instance. A 409 INCOMPLETE must always list
+// the members whose gaps caused the refusal — the verdict and its details
+// come from the same locked snapshot, so the response can never be an
+// INCOMPLETE with an empty batches list while a follow-up query shows the
+// group complete-but-OPEN or already SEALED.
+func TestHTTPSealGroupIncompleteNeverEmptyBatches(t *testing.T) {
+	u1, u2, cleanup := newAPIs(t)
+	defer cleanup()
+	c := newClient()
+
+	const rounds = 25
+	for i := 0; i < rounds; i++ {
+		_, body := c.post(t, u1+"/api/v1/batches", map[string]int{"expectedChunks": 1})
+		a := body["batchId"].(string)
+		_, body = c.post(t, u2+"/api/v1/batches", map[string]int{"expectedChunks": 2})
+		b := body["batchId"].(string)
+		c.post(t, u1+"/api/v1/batches/"+a+"/chunks", map[string]any{"seq": 1, "payload": "a"})
+		c.post(t, u2+"/api/v1/batches/"+b+"/chunks", map[string]any{"seq": 1, "payload": "b1"})
+		// B is missing only its final chunk (seq 2).
+
+		type result struct {
+			code  int
+			body  map[string]any
+			group bool
+		}
+		resCh := make(chan result, 2)
+		go func() {
+			code, resp := c.postQuiet(u1+"/api/v1/batches/seal-group",
+				map[string]any{"batchIds": []string{a, b}})
+			resCh <- result{code, resp, true}
+		}()
+		go func() {
+			code, resp := c.postQuiet(u2+"/api/v1/batches/"+b+"/chunks",
+				map[string]any{"seq": 2, "payload": "b2"})
+			resCh <- result{code, resp, false}
+		}()
+
+		var group, chunk result
+		timeout := time.After(30 * time.Second)
+		for got := 0; got < 2; got++ {
+			select {
+			case r := <-resCh:
+				if r.group {
+					group = r
+				} else {
+					chunk = r
+				}
+			case <-timeout:
+				t.Fatalf("round %d: group-seal/final-chunk race deadlocked", i)
+			}
+		}
+		if group.code == 0 || chunk.code == 0 {
+			t.Fatalf("round %d: transport error in race", i)
+		}
+		if chunk.code != 201 {
+			t.Fatalf("round %d: final chunk: code=%d body=%v", i, chunk.code, chunk.body)
+		}
+
+		switch group.code {
+		case 200:
+			// The chunk landed before the verdict: whole group SEALED.
+			members, _ := group.body["batches"].([]any)
+			if len(members) != 2 {
+				t.Fatalf("round %d: 200 group response without 2 members: %v", i, group.body)
+			}
+			for _, m := range members {
+				member := m.(map[string]any)
+				if member["status"] != "SEALED" || member["sealedAt"] == nil {
+					t.Fatalf("round %d: 200 group member not sealed: %v", i, member)
+				}
+			}
+		case 409:
+			if group.body["error"] != "INCOMPLETE" {
+				t.Fatalf("round %d: unexpected 409 body: %v", i, group.body)
+			}
+			// The refusal must name the incomplete members with their gaps;
+			// an empty list here is the handoff bug: the caller cannot tell
+			// that B/seq=2 was missing at verdict time.
+			members, _ := group.body["batches"].([]any)
+			if len(members) == 0 {
+				t.Fatalf("round %d: 409 INCOMPLETE with empty batches list: %v", i, group.body)
+			}
+			for _, m := range members {
+				member := m.(map[string]any)
+				gaps, _ := member["gaps"].([]any)
+				if member["batchId"] != b || len(gaps) == 0 {
+					t.Fatalf("round %d: 409 lists a member without gaps: %v", i, member)
+				}
+			}
+		default:
+			t.Fatalf("round %d: group seal: code=%d body=%v", i, group.code, group.body)
+		}
+
+		// Settling converges: B is complete now, so a follow-up group seal
+		// succeeds (or the group already sealed).
+		code, settle := c.post(t, u2+"/api/v1/batches/seal-group",
+			map[string]any{"batchIds": []string{a, b}})
+		if code != 200 {
+			t.Fatalf("round %d: follow-up group seal: code=%d body=%v", i, code, settle)
+		}
+	}
+}

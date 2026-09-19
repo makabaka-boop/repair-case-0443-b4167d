@@ -60,6 +60,7 @@ func main() {
 	v.checkValidation(ctx)
 	v.checkCrossInstanceSealRace(ctx)
 	v.checkSealGroup(ctx)
+	v.checkSealGroupRace(ctx)
 
 	switch phase := os.Getenv("VERIFY_PHASE"); phase {
 	case "seed":
@@ -453,6 +454,107 @@ func (v *verifier) checkSealGroup(ctx context.Context) {
 		v.failf("group retry changed result: %v", retry)
 	}
 	v.log("seal-group acceptance passed on both instances")
+}
+
+// checkSealGroupRace fires the group seal at one instance and B's final
+// chunk at the other simultaneously. A 409 INCOMPLETE must always list the
+// members whose gaps caused the refusal: the verdict and its details come
+// from the same locked snapshot, so the response can never be an INCOMPLETE
+// with an empty batches list while a follow-up query shows the group
+// complete-but-OPEN or already SEALED.
+func (v *verifier) checkSealGroupRace(ctx context.Context) {
+	const rounds = 25
+	for i := 0; i < rounds; i++ {
+		a := v.createBatch(ctx, v.cfg.api1, 1)
+		b := v.createBatch(ctx, v.cfg.api2, 2)
+		if a == "" || b == "" {
+			return
+		}
+		submit := func(base, id string, seq int, payload string) {
+			code, body, _ := v.request(ctx, http.MethodPost, base+"/api/v1/batches/"+id+"/chunks",
+				map[string]any{"seq": seq, "payload": payload})
+			if code != 201 {
+				v.failf("group race fixture chunk %s/%d: status=%d body=%v", id, seq, code, body)
+			}
+		}
+		submit(v.cfg.api1, a, 1, "a")
+		submit(v.cfg.api2, b, 1, "b1")
+		// b is missing only its final chunk (seq 2).
+
+		type result struct {
+			code  int
+			body  map[string]any
+			group bool
+		}
+		resCh := make(chan result, 2)
+		go func() {
+			code, body, _ := v.request(ctx, http.MethodPost,
+				v.cfg.api1+"/api/v1/batches/seal-group",
+				map[string]any{"batchIds": []string{a, b}})
+			resCh <- result{code, body, true}
+		}()
+		go func() {
+			code, body, _ := v.request(ctx, http.MethodPost,
+				v.cfg.api2+"/api/v1/batches/"+b+"/chunks",
+				map[string]any{"seq": 2, "payload": "b2"})
+			resCh <- result{code, body, false}
+		}()
+		var group, chunk result
+		for got := 0; got < 2; got++ {
+			r := <-resCh
+			if r.group {
+				group = r
+			} else {
+				chunk = r
+			}
+		}
+		if chunk.code != 201 {
+			v.failf("group race round %d: final chunk: status=%d body=%v", i, chunk.code, chunk.body)
+			continue
+		}
+
+		switch group.code {
+		case 200:
+			members, _ := group.body["batches"].([]any)
+			if len(members) != 2 {
+				v.failf("group race round %d: 200 without 2 members: %v", i, group.body)
+				continue
+			}
+			for _, m := range members {
+				member, _ := m.(map[string]any)
+				if member["status"] != "SEALED" || member["sealedAt"] == nil {
+					v.failf("group race round %d: 200 member not sealed: %v", i, member)
+				}
+			}
+		case 409:
+			members, _ := group.body["batches"].([]any)
+			if group.body["error"] != "INCOMPLETE" || len(members) == 0 {
+				v.failf("group race round %d: 409 INCOMPLETE with empty batches list: %v",
+					i, group.body)
+				continue
+			}
+			for _, m := range members {
+				member, _ := m.(map[string]any)
+				gaps, _ := member["gaps"].([]any)
+				if member["batchId"] != b || len(gaps) == 0 {
+					v.failf("group race round %d: 409 lists a member without gaps: %v", i, member)
+				}
+			}
+		default:
+			v.failf("group race round %d: group seal: status=%d body=%v", i, group.code, group.body)
+			continue
+		}
+
+		// Settling converges: b is complete now, so a follow-up group seal
+		// succeeds (or the group already sealed).
+		code, settle, _ := v.request(ctx, http.MethodPost,
+			v.cfg.api2+"/api/v1/batches/seal-group",
+			map[string]any{"batchIds": []string{a, b}})
+		if code != 200 {
+			v.failf("group race round %d: follow-up group seal: status=%d body=%v", i, code, settle)
+		}
+	}
+	v.log("seal-group vs final-chunk race passed (%d rounds)", rounds)
 }
 
 // persistedState is handed across the API restart via a shared volume.

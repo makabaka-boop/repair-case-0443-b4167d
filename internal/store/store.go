@@ -298,8 +298,8 @@ func (s *Store) SealBatch(ctx context.Context, batchID string) (*Snapshot, error
 // Return values:
 //
 //   - all OPEN members complete: snapshots in request order, nil
-//   - any OPEN member has gaps: latest snapshots in request order,
-//     ErrIncomplete; no member changes (the transaction rolls back)
+//   - any OPEN member has gaps: the post-lock verdict snapshots in request
+//     order, ErrIncomplete; no member changes (the transaction rolls back)
 //   - any id unknown: nil, ErrNotFound; no member changes
 func (s *Store) SealGroup(ctx context.Context, ids []string) ([]*Snapshot, error) {
 	// Deterministic ascending lock order. Duplicates (rejected by the API)
@@ -391,22 +391,17 @@ func (s *Store) SealGroup(ctx context.Context, ids []string) ([]*Snapshot, error
 
 	for _, snap := range byID {
 		if snap.Status == StatusOpen && len(snap.Gaps) > 0 {
-			// Release the member locks before refreshing the response so an
-			// incomplete result does not hold up chunk writers while its
-			// details are assembled.
-			if err := tx.Rollback(ctx); err != nil {
-				return nil, err
-			}
-
-			refreshed := make([]*Snapshot, 0, len(ids))
-			for _, id := range ids {
-				latest, err := s.Snapshot(ctx, id)
-				if err != nil {
-					return nil, err
-				}
-				refreshed = append(refreshed, latest)
-			}
-			return refreshed, ErrIncomplete
+			// Report the verdict exactly as adjudicated under the row locks.
+			// Rolling back first and re-reading the members would open a
+			// window in which the writers the locks just excluded — the
+			// final chunk queued behind this transaction, or a concurrent
+			// successful group seal — commit and rewrite the failure
+			// details, up to an INCOMPLETE response that names no
+			// incomplete member while the database shows the group
+			// complete or even SEALED. The deferred rollback releases the
+			// locks as this returns; the gap details were already computed
+			// inside the transaction, so nothing is assembled afterwards.
+			return ordered, ErrIncomplete
 		}
 	}
 

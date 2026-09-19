@@ -685,6 +685,24 @@ func TestSealGroupThreeWayRace(t *testing.T) {
 		}
 		assertGroupResponseConsistent("[A,B]", snapsAB, errAB)
 		assertGroupResponseConsistent("[B,A]", snapsBA, errBA)
+		// An INCOMPLETE response must carry the adjudicated verdict: some
+		// member still OPEN with a non-empty gap list. A failure snapshot in
+		// which every member already looks complete (or SEALED) contradicts
+		// the 409 and hides what was missing.
+		assertIncompleteNamesGap := func(label string, ordered []*store.Snapshot, e error) {
+			t.Helper()
+			if !errors.Is(e, store.ErrIncomplete) {
+				return
+			}
+			for _, got := range ordered {
+				if got.Status == store.StatusOpen && len(got.Gaps) > 0 {
+					return
+				}
+			}
+			t.Fatalf("round %d: %s INCOMPLETE names no incomplete member: %+v", i, label, ordered)
+		}
+		assertIncompleteNamesGap("[A,B]", snapsAB, errAB)
+		assertIncompleteNamesGap("[B,A]", snapsBA, errBA)
 		if sealedA {
 			if len(snapA.Gaps) != 0 || len(snapB.Gaps) != 0 {
 				t.Fatalf("round %d: SEALED with gaps: %+v %+v", i, snapA, snapB)
@@ -796,6 +814,38 @@ func waitForTupleLock(ctx context.Context, t *testing.T, schema, batchID string)
 					SELECT 1 FROM pg_locks w
 					WHERE w.pid = tl.pid AND w.granted = false
 				  )
+			)`, schema, batchID).Scan(&waiting)
+		if err != nil {
+			t.Fatalf("scan lock state: %v", err)
+		}
+		if waiting {
+			return true
+		}
+		time.Sleep(2 * time.Millisecond)
+	}
+	return false
+}
+
+// waitForQueuedTupleLock polls until a second backend is queued on the
+// batches row's tuple lock behind the first waiter, returning false on
+// timeout. The first waiter holds the prospective (granted) tuple lock and
+// sleeps on the lock holder's transaction id; a backend arriving behind it
+// carries an ungranted tuple lock on the same row.
+func waitForQueuedTupleLock(ctx context.Context, t *testing.T, schema, batchID string) bool {
+	t.Helper()
+	deadline := time.Now().Add(10 * time.Second)
+	for time.Now().Before(deadline) {
+		var waiting bool
+		err := basePool.QueryRow(ctx, `
+			SELECT EXISTS (
+				SELECT 1
+				FROM pg_locks tl
+				JOIN `+schema+`.batches b
+				  ON tl.page = (b.ctid::text::point)[0]::int
+				 AND tl.tuple = (b.ctid::text::point)[1]::int
+				WHERE tl.locktype = 'tuple' AND tl.granted = false
+				  AND tl.relation = ($1 || '.batches')::regclass
+				  AND b.id = $2
 			)`, schema, batchID).Scan(&waiting)
 		if err != nil {
 			t.Fatalf("scan lock state: %v", err)
@@ -1132,6 +1182,156 @@ func TestSealGroupSeesChunkCommittedDuringLockWait(t *testing.T) {
 		if db.Status != store.StatusSealed || len(db.Gaps) != 0 ||
 			db.SealedAt == nil || !db.SealedAt.Equal(*snaps[i].SealedAt) {
 			t.Fatalf("database disagrees with group response: db=%+v resp=%+v", db, snaps[i])
+		}
+	}
+}
+
+// TestSealGroupIncompleteReportsVerdictSnapshot stages the handoff race in
+// which the group seal adjudicates B incomplete while B's final chunk is
+// queued behind the group's row locks: the chunk commits the moment the
+// group transaction ends. The INCOMPLETE result must describe the state as
+// adjudicated under the locks — B OPEN with gaps [2] — not the post-release
+// state in which B is already complete (or, with a follow-up seal in
+// between, even SEALED). A failure response that names no incomplete member
+// contradicts every observable state and hides which chunk was missing, so
+// the caller cannot tell the seal condition apart from a lost chunk.
+func TestSealGroupIncompleteReportsVerdictSnapshot(t *testing.T) {
+	ctx := context.Background()
+	s, newPeer := newStore(ctx, t)
+	peer := newPeer()
+	defer peer.Close()
+
+	// Padding members (all complete) precede B in request order. An
+	// implementation that re-reads the members after releasing the locks
+	// walks them in request order, so a long prefix guarantees the queued
+	// chunk has landed before B is re-observed — turning a stale
+	// post-release read from a coin flip into a certainty.
+	pads := make([]*store.Batch, 0, 8)
+	for range 8 {
+		p := mustBatch(ctx, t, s, 1)
+		if _, err := s.SubmitChunk(ctx, p.ID, 1, []byte("p")); err != nil {
+			t.Fatal(err)
+		}
+		pads = append(pads, p)
+	}
+	a := mustBatch(ctx, t, s, 1)
+	b := mustBatch(ctx, t, s, 2)
+	if _, err := s.SubmitChunk(ctx, a.ID, 1, []byte("a")); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.SubmitChunk(ctx, b.ID, 1, []byte("b1")); err != nil {
+		t.Fatal(err)
+	}
+	// B is missing only its final chunk (seq 2).
+
+	// Hold B's row lock on a raw connection: the group seal parks on it,
+	// and the final chunk submitted afterwards queues behind the group.
+	schema := testSchema(t)
+	blocker, err := basePool.Begin(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer blocker.Rollback(ctx)
+	if _, err := blocker.Exec(ctx, "SET LOCAL search_path = "+schema); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := blocker.Exec(ctx, `SELECT id FROM batches WHERE id = $1 FOR UPDATE`, b.ID); err != nil {
+		t.Fatal(err)
+	}
+
+	ids := make([]string, 0, len(pads)+2)
+	for _, p := range pads {
+		ids = append(ids, p.ID)
+	}
+	ids = append(ids, a.ID, b.ID)
+
+	groupDone := make(chan struct{})
+	var snaps []*store.Snapshot
+	var groupErr error
+	go func() {
+		defer close(groupDone)
+		snaps, groupErr = s.SealGroup(ctx, ids)
+	}()
+	if !waitForTupleLock(ctx, t, schema, b.ID) {
+		t.Fatal("group seal never parked waiting for B's row lock")
+	}
+
+	chunkDone := make(chan struct{})
+	var chunkErr error
+	go func() {
+		defer close(chunkDone)
+		_, chunkErr = peer.SubmitChunk(ctx, b.ID, 2, []byte("b2"))
+	}()
+	if !waitForQueuedTupleLock(ctx, t, schema, b.ID) {
+		t.Fatal("final chunk never queued behind the group seal")
+	}
+
+	// Release the blocker: the group acquires its locks while the chunk is
+	// still queued behind it, so the verdict must be INCOMPLETE with B
+	// missing seq 2; the chunk commits right after the group transaction.
+	if err := blocker.Commit(ctx); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case <-groupDone:
+	case <-time.After(30 * time.Second):
+		t.Fatal("group seal deadlocked")
+	}
+	select {
+	case <-chunkDone:
+	case <-time.After(30 * time.Second):
+		t.Fatal("queued final chunk deadlocked")
+	}
+	if chunkErr != nil {
+		t.Fatalf("final chunk: %v", chunkErr)
+	}
+
+	if !errors.Is(groupErr, store.ErrIncomplete) {
+		t.Fatalf("group adjudicated while the final chunk was still queued, "+
+			"so it must report INCOMPLETE; got %v", groupErr)
+	}
+	if len(snaps) != len(ids) {
+		t.Fatalf("want %d member snapshots in request order, got %d", len(ids), len(snaps))
+	}
+	for i, snap := range snaps {
+		if snap.ID != ids[i] {
+			t.Fatalf("snapshots not in request order at %d: %+v", i, snaps)
+		}
+	}
+	// The failure must name the member and the chunk missing at verdict
+	// time — B OPEN, received 1, gaps [2] — not the post-release state in
+	// which B is already complete.
+	last := snaps[len(snaps)-1]
+	if last.Status != store.StatusOpen || last.Received != 1 ||
+		len(last.Gaps) != 1 || last.Gaps[0] != 2 {
+		t.Fatalf("INCOMPLETE must report B as adjudicated (OPEN, gaps [2]); got %+v", last)
+	}
+	for _, snap := range snaps[:len(snaps)-1] {
+		if len(snap.Gaps) != 0 {
+			t.Fatalf("complete member reported gaps: %+v", snap)
+		}
+	}
+
+	// The queued chunk landed right after the verdict: B is complete but
+	// still OPEN — exactly what the caller observes on the next query, and
+	// consistent with the 409 it just received.
+	db, err := s.Snapshot(ctx, b.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if db.Status != store.StatusOpen || len(db.Gaps) != 0 {
+		t.Fatalf("post-handoff state should be complete and OPEN: %+v", db)
+	}
+
+	// A follow-up group seal now succeeds; the earlier 409 stays truthful
+	// because it described the state at its own verdict point.
+	sealed, err := s.SealGroup(ctx, ids)
+	if err != nil {
+		t.Fatalf("follow-up group seal: %v", err)
+	}
+	for _, snap := range sealed {
+		if snap.Status != store.StatusSealed {
+			t.Fatalf("follow-up seal left member OPEN: %+v", snap)
 		}
 	}
 }

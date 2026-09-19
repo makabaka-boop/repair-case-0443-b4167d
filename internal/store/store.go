@@ -1,0 +1,506 @@
+// Package store persists batches and chunks in PostgreSQL.
+//
+// All coordination between API instances happens through database row locks,
+// so any number of processes sharing one database reach the same verdict for
+// a batch: duplicate chunks are idempotent, conflicting payloads are rejected
+// and a batch can only become SEALED when its full chunk set is present.
+package store
+
+import (
+	"bytes"
+	"context"
+	"crypto/rand"
+	_ "embed"
+	"encoding/hex"
+	"errors"
+	"fmt"
+	"sort"
+	"time"
+
+	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgconn"
+	"github.com/jackc/pgx/v5/pgxpool"
+)
+
+//go:embed schema.sql
+var schemaSQL string
+
+const (
+	StatusOpen   = "OPEN"
+	StatusSealed = "SEALED"
+)
+
+var (
+	ErrNotFound   = errors.New("batch not found")
+	ErrConflict   = errors.New("chunk conflict")
+	ErrSealed     = errors.New("batch sealed")
+	ErrIncomplete = errors.New("batch incomplete")
+	ErrSeqRange   = errors.New("sequence out of range")
+)
+
+// Batch is the persisted batch header.
+type Batch struct {
+	ID             string
+	ExpectedChunks int
+	Status         string
+	CreatedAt      time.Time
+	SealedAt       *time.Time
+}
+
+// Snapshot is a consistent view of a batch: counts and gaps are computed by
+// the same SQL statement.
+type Snapshot struct {
+	Batch
+	Received int
+	Gaps     []int
+}
+
+// SubmitResult describes one accepted chunk write. A duplicate (same batch,
+// seq and byte-identical payload) reports Created == false together with the
+// stored confirmation of the original write.
+type SubmitResult struct {
+	Created    bool
+	Seq        int
+	Size       int
+	ReceivedAt time.Time
+}
+
+// Store wraps a connection pool.
+type Store struct {
+	pool *pgxpool.Pool
+}
+
+// New connects, verifies the connection and applies the schema.
+func New(ctx context.Context, databaseURL string) (*Store, error) {
+	cfg, err := pgxpool.ParseConfig(databaseURL)
+	if err != nil {
+		return nil, fmt.Errorf("parse database url: %w", err)
+	}
+	cfg.MaxConns = 10
+	pool, err := pgxpool.NewWithConfig(ctx, cfg)
+	if err != nil {
+		return nil, fmt.Errorf("connect database: %w", err)
+	}
+	if err := pool.Ping(ctx); err != nil {
+		pool.Close()
+		return nil, fmt.Errorf("ping database: %w", err)
+	}
+	s := &Store{pool: pool}
+	if err := s.migrate(ctx); err != nil {
+		pool.Close()
+		return nil, err
+	}
+	return s, nil
+}
+
+// Close releases the pool.
+func (s *Store) Close() { s.pool.Close() }
+
+// migrationLockID serialises schema migrations across API instances booting
+// at the same time. Concurrent CREATE TABLE IF NOT EXISTS on a fresh database
+// otherwise races in the system catalog (SQLSTATE 23505).
+const migrationLockID int64 = 0x5B4A_4545_414C_0001
+
+func (s *Store) migrate(ctx context.Context) error {
+	// DDL is transactional in PostgreSQL; the advisory lock makes concurrent
+	// first boots take turns: the loser blocks here, then finds every object
+	// present and the IF NOT EXISTS statements become no-ops.
+	tx, err := s.pool.Begin(ctx)
+	if err != nil {
+		return fmt.Errorf("begin migration: %w", err)
+	}
+	defer tx.Rollback(ctx)
+
+	if _, err := tx.Exec(ctx, `SELECT pg_advisory_xact_lock($1)`, migrationLockID); err != nil {
+		return fmt.Errorf("acquire migration lock: %w", err)
+	}
+	if _, err := tx.Exec(ctx, schemaSQL); err != nil {
+		return fmt.Errorf("apply schema: %w", err)
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return fmt.Errorf("commit migration: %w", err)
+	}
+	return nil
+}
+
+// NewBatchID returns a random 128-bit hex identifier.
+func NewBatchID() string {
+	var b [16]byte
+	if _, err := rand.Read(b[:]); err != nil {
+		panic(err)
+	}
+	return hex.EncodeToString(b[:])
+}
+
+// CreateBatch inserts an OPEN batch. A random ID collision is retried.
+func (s *Store) CreateBatch(ctx context.Context, expectedChunks int) (*Batch, error) {
+	const maxAttempts = 3
+	for range maxAttempts {
+		id := NewBatchID()
+		var b Batch
+		err := s.pool.QueryRow(ctx,
+			`INSERT INTO batches (id, expected_chunks) VALUES ($1, $2)
+			 RETURNING id, expected_chunks, status, created_at, sealed_at`,
+			id, expectedChunks,
+		).Scan(&b.ID, &b.ExpectedChunks, &b.Status, &b.CreatedAt, &b.SealedAt)
+		if err == nil {
+			return &b, nil
+		}
+		var pgErr *pgconn.PgError
+		if errors.As(err, &pgErr) && pgErr.Code == "23505" { // unique_violation
+			continue
+		}
+		return nil, err
+	}
+	return nil, errors.New("could not allocate unique batch id")
+}
+
+// SubmitChunk stores a chunk. The batch row is locked for the duration of the
+// transaction, serialising it against a concurrent seal. Return values:
+//
+//   - first write: result.Created == true, nil
+//   - retransmission with identical UTF-8 bytes: result.Created == false, nil
+//   - same seq, different payload: zero result, ErrConflict
+//   - sealed batch, any non-identical write: zero result, ErrSealed
+func (s *Store) SubmitChunk(ctx context.Context, batchID string, seq int, payload []byte) (SubmitResult, error) {
+	tx, err := s.pool.Begin(ctx)
+	if err != nil {
+		return SubmitResult{}, err
+	}
+	defer tx.Rollback(ctx)
+
+	var expected int
+	var status string
+	err = tx.QueryRow(ctx,
+		`SELECT expected_chunks, status FROM batches WHERE id = $1 FOR UPDATE`,
+		batchID,
+	).Scan(&expected, &status)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return SubmitResult{}, ErrNotFound
+	}
+	if err != nil {
+		return SubmitResult{}, err
+	}
+	if seq < 1 || seq > expected {
+		return SubmitResult{}, ErrSeqRange
+	}
+	if status == StatusSealed {
+		// Identical retransmissions of an existing chunk stay allowed;
+		// anything else is rejected.
+		var existing []byte
+		var receivedAt time.Time
+		err := tx.QueryRow(ctx,
+			`SELECT payload, received_at FROM chunks WHERE batch_id = $1 AND seq = $2`,
+			batchID, seq,
+		).Scan(&existing, &receivedAt)
+		if err == nil && bytes.Equal(existing, payload) {
+			return SubmitResult{Created: false, Seq: seq, Size: len(payload), ReceivedAt: receivedAt}, nil
+		}
+		return SubmitResult{}, ErrSealed
+	}
+
+	var existing []byte
+	var receivedAt time.Time
+	err = tx.QueryRow(ctx,
+		`SELECT payload, received_at FROM chunks WHERE batch_id = $1 AND seq = $2`,
+		batchID, seq,
+	).Scan(&existing, &receivedAt)
+	switch {
+	case err == nil:
+		if !bytes.Equal(existing, payload) {
+			return SubmitResult{}, ErrConflict
+		}
+		if err := tx.Commit(ctx); err != nil {
+			return SubmitResult{}, err
+		}
+		return SubmitResult{Created: false, Seq: seq, Size: len(payload), ReceivedAt: receivedAt}, nil
+	case errors.Is(err, pgx.ErrNoRows):
+		// proceed to insert
+	default:
+		return SubmitResult{}, err
+	}
+
+	if err := tx.QueryRow(ctx,
+		`INSERT INTO chunks (batch_id, seq, payload) VALUES ($1, $2, $3)
+		 RETURNING received_at`,
+		batchID, seq, payload,
+	).Scan(&receivedAt); err != nil {
+		return SubmitResult{}, err
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return SubmitResult{}, err
+	}
+	return SubmitResult{Created: true, Seq: seq, Size: len(payload), ReceivedAt: receivedAt}, nil
+}
+
+// Snapshot returns a consistent status view of a batch.
+func (s *Store) Snapshot(ctx context.Context, batchID string) (*Snapshot, error) {
+	return snapshotQuery(ctx, s.pool, batchID, false)
+}
+
+// SealBatch atomically seals a batch when its chunk set is complete.
+//
+// The batch row is locked before counting, so a seal racing with the final
+// chunk cannot commit a SEALED batch that is still missing a piece: one
+// transaction waits for the other, then observes the final state.
+// ErrIncomplete is returned together with the post-lock snapshot so the API
+// can report the ascending gap list. A repeated seal is idempotent and
+// returns the existing SEALED snapshot with nil.
+func (s *Store) SealBatch(ctx context.Context, batchID string) (*Snapshot, error) {
+	tx, err := s.pool.Begin(ctx)
+	if err != nil {
+		return nil, err
+	}
+	defer tx.Rollback(ctx)
+
+	snap, err := snapshotQuery(ctx, tx, batchID, true)
+	if err != nil {
+		return nil, err
+	}
+	if snap.Status == StatusSealed {
+		// Idempotent: repeated seal returns the existing result unchanged.
+		return snap, nil
+	}
+	if len(snap.Gaps) > 0 {
+		return snap, ErrIncomplete
+	}
+	var sealedAt time.Time
+	if err := tx.QueryRow(ctx,
+		`UPDATE batches SET status = $1, sealed_at = now() WHERE id = $2
+		 RETURNING sealed_at`,
+		StatusSealed, batchID,
+	).Scan(&sealedAt); err != nil {
+		return nil, err
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return nil, err
+	}
+	snap.Status = StatusSealed
+	snap.SealedAt = &sealedAt
+	return snap, nil
+}
+
+// SealGroup atomically seals a set of batches as one indivisible unit.
+//
+// Every member row is locked in ascending ID order inside a single
+// transaction — the same row-lock arbitration SubmitChunk and SealBatch use
+// for their one row — so a reversed pair of group requests, a single-batch
+// seal and the final chunk submission serialise on the same locks without
+// deadlocking. The transaction runs READ COMMITTED like every other
+// operation: a stronger level would pin the verdict snapshot to before the
+// lock wait, hiding chunks committed during the wait and turning a
+// concurrent sealer into a serialization failure instead of an idempotent
+// success. Gaps are computed from the post-lock snapshot, and the group
+// commits only when every OPEN member is complete: the batch set can never
+// be observed partially sealed. Members already SEALED count as idempotent
+// successes and keep their original sealedAt.
+//
+// Return values:
+//
+//   - all OPEN members complete: snapshots in request order, nil
+//   - any OPEN member has gaps: latest snapshots in request order,
+//     ErrIncomplete; no member changes (the transaction rolls back)
+//   - any id unknown: nil, ErrNotFound; no member changes
+func (s *Store) SealGroup(ctx context.Context, ids []string) ([]*Snapshot, error) {
+	// Deterministic ascending lock order. Duplicates (rejected by the API)
+	// would only lock the same row twice, so collapse them defensively.
+	sorted := make([]string, 0, len(ids))
+	seen := make(map[string]struct{}, len(ids))
+	for _, id := range ids {
+		if _, ok := seen[id]; ok {
+			continue
+		}
+		seen[id] = struct{}{}
+		sorted = append(sorted, id)
+	}
+	sort.Strings(sorted)
+
+	// READ COMMITTED is load-bearing, not a default to tighten. The locking
+	// SELECT below starts executing — and under REPEATABLE READ would pin the
+	// transaction snapshot — before it waits on any row lock, so with a
+	// stronger level a chunk committed during the wait would stay invisible
+	// and be misreported as a gap, and a member sealed by a concurrent
+	// transaction would abort the lock wait with SQLSTATE 40001 instead of
+	// being re-read as SEALED. Here every statement snapshots after the locks
+	// are held, and member rows cannot change between the gap check and the
+	// UPDATE: every writer must hold these same row locks first.
+	tx, err := s.pool.BeginTx(ctx, pgx.TxOptions{IsoLevel: pgx.ReadCommitted})
+	if err != nil {
+		return nil, err
+	}
+	defer tx.Rollback(ctx)
+
+	// LockRows sits above the sort in the plan, so the FOR UPDATE locks are
+	// acquired in ascending ID order in one statement.
+	rows, err := tx.Query(ctx,
+		`SELECT id, expected_chunks, status, created_at, sealed_at
+		 FROM batches WHERE id = ANY($1) ORDER BY id FOR UPDATE`, sorted)
+	if err != nil {
+		return nil, err
+	}
+	byID := make(map[string]*Snapshot, len(sorted))
+	for rows.Next() {
+		snap := &Snapshot{}
+		if err := rows.Scan(&snap.ID, &snap.ExpectedChunks, &snap.Status, &snap.CreatedAt, &snap.SealedAt); err != nil {
+			rows.Close()
+			return nil, err
+		}
+		byID[snap.ID] = snap
+	}
+	rows.Close()
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	if len(byID) != len(sorted) {
+		return nil, ErrNotFound
+	}
+
+	// Gaps for every member from the post-lock snapshot, in one query.
+	gapRows, err := tx.Query(ctx, `
+		SELECT b.id, s.seq
+		FROM batches b
+		CROSS JOIN LATERAL generate_series(1, b.expected_chunks) AS s(seq)
+		WHERE b.id = ANY($1)
+		  AND NOT EXISTS (
+			SELECT 1 FROM chunks c WHERE c.batch_id = b.id AND c.seq = s.seq
+		  )
+		ORDER BY b.id, s.seq ASC`, sorted)
+	if err != nil {
+		return nil, err
+	}
+	for gapRows.Next() {
+		var id string
+		var g int
+		if err := gapRows.Scan(&id, &g); err != nil {
+			gapRows.Close()
+			return nil, err
+		}
+		byID[id].Gaps = append(byID[id].Gaps, g)
+	}
+	gapRows.Close()
+	if err := gapRows.Err(); err != nil {
+		return nil, err
+	}
+
+	ordered := make([]*Snapshot, 0, len(ids))
+	for _, id := range ids {
+		snap := byID[id]
+		snap.Received = snap.ExpectedChunks - len(snap.Gaps)
+		ordered = append(ordered, snap)
+	}
+
+	for _, snap := range byID {
+		if snap.Status == StatusOpen && len(snap.Gaps) > 0 {
+			// Release the member locks before refreshing the response so an
+			// incomplete result does not hold up chunk writers while its
+			// details are assembled.
+			if err := tx.Rollback(ctx); err != nil {
+				return nil, err
+			}
+
+			refreshed := make([]*Snapshot, 0, len(ids))
+			for _, id := range ids {
+				latest, err := s.Snapshot(ctx, id)
+				if err != nil {
+					return nil, err
+				}
+				refreshed = append(refreshed, latest)
+			}
+			return refreshed, ErrIncomplete
+		}
+	}
+
+	// Seal every OPEN member from inside THIS transaction while the FOR
+	// UPDATE locks are still held. The write must never be split off into a
+	// separate auto-committed statement: after this transaction commits the
+	// locks are released, and a SealBatch or another SealGroup interleaved in
+	// that gap could seal one member before another, or make this statement
+	// match zero rows while the in-memory snapshots above still report OPEN —
+	// a 200 response contradicting the database. Under the locks the UPDATE
+	// is atomic with the gap validation, and one now() value stamps every
+	// member the group seals; SEALED members are untouched and keep their
+	// stored sealedAt.
+	sealRows, err := tx.Query(ctx,
+		`UPDATE batches SET status = $1, sealed_at = now()
+		 WHERE id = ANY($2) AND status = $3
+		 RETURNING id, sealed_at`, StatusSealed, sorted, StatusOpen)
+	if err != nil {
+		return nil, err
+	}
+	for sealRows.Next() {
+		var id string
+		var sealedAt time.Time
+		if err := sealRows.Scan(&id, &sealedAt); err != nil {
+			sealRows.Close()
+			return nil, err
+		}
+		snap := byID[id]
+		snap.Status = StatusSealed
+		snap.SealedAt = &sealedAt
+	}
+	sealRows.Close()
+	if err := sealRows.Err(); err != nil {
+		return nil, err
+	}
+
+	if err := tx.Commit(ctx); err != nil {
+		return nil, err
+	}
+
+	return ordered, nil
+}
+
+// querier is satisfied by both a pool and a transaction.
+type querier interface {
+	QueryRow(ctx context.Context, sql string, args ...any) pgx.Row
+	Query(ctx context.Context, sql string, args ...any) (pgx.Rows, error)
+}
+
+// snapshotQuery reads header, received count and ascending gaps in one
+// transaction snapshot, so the numbers always agree. With forUpdate the
+// caller owns the batch row lock for the surrounding transaction.
+func snapshotQuery(ctx context.Context, q querier, batchID string, forUpdate bool) (*Snapshot, error) {
+	// Missing sequences are the complement of the stored set within
+	// [1, expectedChunks]. generate_series materialises the full range; the
+	// expected count is capped at 10000 so this stays cheap.
+	lock := ""
+	if forUpdate {
+		lock = " FOR UPDATE"
+	}
+
+	var snap Snapshot
+	err := q.QueryRow(ctx,
+		`SELECT id, expected_chunks, status, created_at, sealed_at
+		 FROM batches WHERE id = $1`+lock, batchID,
+	).Scan(&snap.ID, &snap.ExpectedChunks, &snap.Status, &snap.CreatedAt, &snap.SealedAt)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return nil, ErrNotFound
+	}
+	if err != nil {
+		return nil, err
+	}
+
+	rows, err := q.Query(ctx, `
+		SELECT s.seq
+		FROM generate_series(1, $1::int) AS s(seq)
+		WHERE NOT EXISTS (
+			SELECT 1 FROM chunks c WHERE c.batch_id = $2 AND c.seq = s.seq
+		)
+		ORDER BY s.seq ASC`, snap.ExpectedChunks, batchID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var g int
+		if err := rows.Scan(&g); err != nil {
+			return nil, err
+		}
+		snap.Gaps = append(snap.Gaps, g)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	snap.Received = snap.ExpectedChunks - len(snap.Gaps)
+	return &snap, nil
+}
